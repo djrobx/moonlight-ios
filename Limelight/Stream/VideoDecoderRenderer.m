@@ -109,6 +109,8 @@
 }
 
 // TODO: Refactor this
+#define BUFFER_LOCK_TIME 60*40;
+
 int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
 
 - (void)displayLinkCallback:(CADisplayLink *)sender
@@ -116,22 +118,58 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     VIDEO_FRAME_HANDLE handle;
     PDECODE_UNIT du;
     
+    bool useFramePacing = false;
+    if (framePacing)
+    {
+        // Calculate the actual display refresh rate
+        // Only pace frames if the display refresh rate is >= 90% of our stream frame rate.
+        // Battery saver, accessibility settings, or device thermals can cause the actual
+        // refresh rate of the display to drop below the physical maximum.
+        
+        double displayRefreshRate = 1 / (_displayLink.targetTimestamp - _displayLink.timestamp);
+        useFramePacing = (displayRefreshRate >= frameRate * 0.9f);
+        if (!useFramePacing)
+            Log(LOG_I, @"VDR Frame Pacing is disabled!");
+    }
+    
+    static int bufferLock = 0;
+    if (bufferLock)
+        bufferLock--;
+
+    int pendingFrames = LiGetPendingVideoFrames();
+
+    if (useFramePacing && bufferLock == 0)
+    {
+        // Pre-rendering, we want to target 2 available frames
+        // (1 will be rendered here, 1 in the buffer)
+        // If we are in a buffer lock state, we allow it to drop to an empty buffer
+        
+        if (pendingFrames <= 1)
+        {
+            if (pendingFrames == 1)
+            {
+                bufferLock = BUFFER_LOCK_TIME;
+            }
+            Log(LOG_I, @"VDR Buffer Underrun %d", pendingFrames);
+            return;
+        }
+    }
+        
     while (LiPollNextVideoFrame(&handle, &du)) {
         LiCompleteVideoFrame(handle, DrSubmitDecodeUnit(du));
         
-        if (framePacing) {
-            // Calculate the actual display refresh rate
-            double displayRefreshRate = 1 / (_displayLink.targetTimestamp - _displayLink.timestamp);
-            
-            // Only pace frames if the display refresh rate is >= 90% of our stream frame rate.
-            // Battery saver, accessibility settings, or device thermals can cause the actual
-            // refresh rate of the display to drop below the physical maximum.
-            if (displayRefreshRate >= frameRate * 0.9f) {
-                // Keep one pending frame to smooth out gaps due to
-                // network jitter at the cost of 1 frame of latency
-                if (LiGetPendingVideoFrames() == 1) {
-                    break;
-                }
+        if (useFramePacing) {
+            pendingFrames--;
+            // If we are in a buffer lock state, allow up to 2 queued frames
+            // Otherwise lock to 1
+            if ((bufferLock && pendingFrames <= 2) || pendingFrames <= 1)
+                break;
+            else if (pendingFrames == 2)
+            {
+                // 2 or more frames remain afer rendering.  Consume them down to 1,
+                // then lock the buffer.
+                Log(LOG_I, @"VDR Buffer Overrun");
+                bufferLock = BUFFER_LOCK_TIME;
             }
         }
     }
